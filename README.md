@@ -1,1 +1,1 @@
-# discrete-elastic-ribbon-jax
+### Dismech-JAX
