@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import equinox as eqx
 
 from ..models import DER
-from ..stencils import Triplet
+from ..stencils import Triplet, Multiplet
 from ..states import TripletState
 from ..params import Geometry, Material
 from .system import System
@@ -127,6 +127,109 @@ class Rod(System[TripletState]):
         N_triplets = (q.shape[0] + 1) // 4 - 2
         starts = jnp.arange(N_triplets) * 4
         return jax.vmap(lambda s: jax.lax.dynamic_slice(q, (s,), (11,)))(starts)
+
+    @staticmethod
+    def global_q_to_multi_q(q: jax.Array) -> jax.Array:
+        """Extract overlapping 19-DOF windows for each Multiplet (5-node).
+
+        Multiplet k covers triplets (k, k+1, k+2) centred at nodes (k+1, k+2, k+3).
+        N_multi = N - 4. Start offsets: 0, 4, 8, ..., 4*(N-5).
+        """
+        N_multi = (q.shape[0] + 1) // 4 - 4
+        starts = jnp.arange(N_multi) * 4
+        return jax.vmap(lambda s: jax.lax.dynamic_slice(q, (s,), (19,)))(starts)
+
+    # ------------------------------------------------------------------ #
+    # Multiplet-mode energy/force (triplet-stencil model using 5-node    #
+    # windows over 3 adjacent triplets).                                 #
+    # ------------------------------------------------------------------ #
+    def _build_multiplets(self, multi_aux: TripletState) -> Multiplet:
+        """Pack the 3 adjacent sub-triplets required by each Multiplet.
+
+        Returns a Multiplet pytree batched over N_multi. Relies on
+        `self.triplets` being Triplet-batched over N_triplets.
+        """
+        N_tri = jax.tree_util.tree_leaves(self.triplets)[0].shape[0]
+        N_multi = N_tri - 2
+
+        def _slice_tri(k):
+            return jax.tree.map(
+                lambda x: jax.lax.dynamic_slice(x, (k,) + (0,) * (x.ndim - 1),
+                                                 (3,) + x.shape[1:]),
+                self.triplets,
+            )
+
+        # Build batched Multiplet by vmap over k.
+        # Each Multiplet holds sub_triplets batched over 3.
+        def _build_one(k):
+            sub_tri = _slice_tri(k)
+            return Multiplet(
+                bar_strain=jnp.zeros(15, dtype=jnp.float64),
+                sub_triplets=sub_tri,
+            )
+        return jax.vmap(_build_one)(jnp.arange(N_multi))
+
+    @staticmethod
+    def multi_aux_from_triplet_aux(aux: TripletState) -> TripletState:
+        """For each Multiplet (5-node window), slice the 3 adjacent triplet
+        aux states into a batched (N_multi, 3, …) TripletState.
+        """
+        N_tri = jax.tree_util.tree_leaves(aux)[0].shape[0]
+        N_multi = N_tri - 2
+
+        def _slice(k):
+            return jax.tree.map(
+                lambda x: jax.lax.dynamic_slice(x, (k,) + (0,) * (x.ndim - 1),
+                                                 (3,) + x.shape[1:]),
+                aux,
+            )
+        return jax.vmap(_slice)(jnp.arange(N_multi))
+
+    def get_E_multi(self, q: jax.Array, model: eqx.Module,
+                     aux: TripletState) -> jax.Array:
+        """Internal energy using Multiplet stencils (+ external-force potential).
+
+        `model` must accept a 15-dim strain vector (3 stacked 5-component
+        triplet strains) and return a scalar. `aux` is the TRIPLET-level aux
+        (not multi-level); we slice it internally.
+        """
+        mult = self._build_multiplets(aux)
+        batch_qs = self.global_q_to_multi_q(q)
+        multi_aux = self.multi_aux_from_triplet_aux(aux)
+        return jnp.sum(
+            jax.vmap(
+                lambda mp, q_loc, a: model(mp.get_strain(q_loc, a))
+            )(mult, batch_qs, multi_aux)
+        ) - jnp.dot(self.F_ext, q)
+
+    def _internal_energy_multi(self, q: jax.Array, model: eqx.Module,
+                                aux: TripletState) -> jax.Array:
+        mult = self._build_multiplets(aux)
+        batch_qs = self.global_q_to_multi_q(q)
+        multi_aux = self.multi_aux_from_triplet_aux(aux)
+        return jnp.sum(
+            jax.vmap(
+                lambda mp, q_loc, a: model(mp.get_strain(q_loc, a))
+            )(mult, batch_qs, multi_aux)
+        )
+
+    def get_F_multi(self, q: jax.Array, model: eqx.Module,
+                     aux: TripletState) -> jax.Array:
+        mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
+        F_int = jax.grad(
+            lambda _q: self._internal_energy_multi(_q, model, aux)
+        )(q)
+        return mask * (self.F_ext - F_int)
+
+    def get_H_multi(self, q: jax.Array, model: eqx.Module,
+                     aux: TripletState) -> jax.Array:
+        mask = jnp.ones_like(q).at[self.bc.idx_b].set(0.0)
+        H = jax.hessian(
+            lambda _q: self._internal_energy_multi(_q, model, aux)
+        )(q)
+        H = H * mask[:, None] * mask[None, :]
+        diag_idx = jnp.arange(H.shape[0])
+        return H.at[diag_idx, diag_idx].add(1.0 - mask)
 
     @staticmethod
     def get_mass(geom: Geometry, material: Material, l_ks: jax.Array) -> jax.Array:
