@@ -19,9 +19,16 @@ import numpy as np
 from .systems.rod import Rod, BC
 from .states import TripletState
 from .params import SimParams
+from .banded_solve import banded_solve, banded_to_dense
 
 
 # ─── Scatter index precomputation ─────────────────────────────────────────────
+
+# Triplet stencil: each triplet holds 11 local DOFs mapped to global indices
+# [4t, 4t+1, ..., 4t+10]. Max |i - j| within a triplet is 10, so the assembled
+# Hessian is symmetric banded with bandwidth k = 10.
+BANDWIDTH = 10
+
 
 def _build_scatter_indices(n_dof, N_triplets):
     """Precompute scatter indices for local 11×11 blocks → global matrix."""
@@ -31,53 +38,41 @@ def _build_scatter_indices(n_dof, N_triplets):
     return local_to_global
 
 
-def _build_hessian_scatter(local_to_global, N_triplets):
-    """Precompute flattened row/col indices for Hessian scatter."""
-    row_idx = jnp.repeat(local_to_global, 11, axis=1).reshape(-1)
-    col_idx = jnp.tile(local_to_global, (1, 11)).reshape(N_triplets, 11, 11).reshape(-1)
-    return row_idx, col_idx
+def _build_banded_scatter(local_to_global, N_triplets, k):
+    """Precompute (band_row, col) indices for banded Hessian scatter.
+
+    Banded storage ab[k + i - j, j] = H[i, j]. For each (triplet, a, b) local
+    pair we scatter local_H[t, a, b] into (k + global_row - global_col, global_col).
+    """
+    row_flat = jnp.repeat(local_to_global, 11, axis=1).reshape(-1)
+    col_flat = jnp.tile(local_to_global, (1, 11)).reshape(N_triplets, 11, 11).reshape(-1)
+    band_row = k + row_flat - col_flat
+    return band_row, col_flat
 
 
 # ─── Fully JIT'd single Newton step ──────────────────────────────────────────
 
-def _robust_solve(H, R, reg, cond_threshold, reg_factor, max_reg_factor):
-    """JAX-compatible robust linear solve matching reference RobustSolver.
+def _robust_banded_solve(H_banded, R, reg, max_reg_factor, k):
+    """Banded linear solve with escalating-reg fallback on singular systems.
 
     Strategy:
-      1. Check condition number of H
-      2. If ill-conditioned: adaptive Tikhonov regularization
-      3. Direct solve
-      4. If NaN: fallback to SVD pseudo-inverse
+      1. Add `reg` to main diagonal of the banded matrix (Tikhonov).
+      2. Banded LU solve via scipy (host callback).
+      3. If NaN/Inf: escalate to `max_reg_factor` on the diagonal and retry.
+      4. If still NaN: convert banded → dense and use SVD pseudo-inverse (rare).
     """
-    n = H.shape[0]
+    H1 = H_banded.at[k, :].add(reg)
+    dq = banded_solve(H1, R, k)
 
-    # Condition number check + adaptive regularization
-    cond = jnp.linalg.cond(H)
-    needs_extra_reg = (cond > cond_threshold) | ~jnp.isfinite(cond)
-    lambda_reg = jnp.where(
-        needs_extra_reg,
-        jnp.where(
-            jnp.isfinite(cond),
-            jnp.minimum(reg_factor * jnp.sqrt(cond), max_reg_factor),
-            max_reg_factor,
-        ),
-        reg,
-    )
-    H_reg = H + lambda_reg * jnp.eye(n)
-
-    # Direct solve
-    dq = jnp.linalg.solve(H_reg, R)
-
-    # SVD fallback if direct solve produced NaN/Inf
-    def svd_fallback(_):
-        # Try max regularization first
-        H_max = H + max_reg_factor * jnp.eye(n)
-        dq2 = jnp.linalg.solve(H_max, R)
+    def escalate_then_svd(_):
+        H2 = H_banded.at[k, :].add(max_reg_factor)
+        dq2 = banded_solve(H2, R, k)
         ok2 = jnp.all(jnp.isfinite(dq2))
 
-        # SVD pseudo-inverse of REGULARIZED H as last resort
-        # Using regularized H avoids amplifying indefinite (negative) eigenvalues
-        U, s, Vt = jnp.linalg.svd(H_max, full_matrices=False)
+        # SVD pseudo-inverse on the regularised dense matrix as last resort.
+        H_dense = banded_to_dense(H2, k)
+        U, s, Vt = jnp.linalg.svd(H_dense, full_matrices=False)
+        n = R.shape[0]
         s_tol = jnp.max(jnp.abs(s)) * jnp.finfo(s.dtype).eps * n
         s_inv = jnp.where(jnp.abs(s) > s_tol, 1.0 / s, 0.0)
         dq_pinv = Vt.T @ (s_inv * (U.T @ R))
@@ -85,59 +80,75 @@ def _robust_solve(H, R, reg, cond_threshold, reg_factor, max_reg_factor):
         return jnp.where(ok2, dq2, dq_pinv)
 
     solve_ok = jnp.all(jnp.isfinite(dq))
-    return jax.lax.cond(solve_ok, lambda _: dq, svd_fallback, None)
+    return jax.lax.cond(solve_ok, lambda _: dq, escalate_then_svd, None)
 
 
 def _make_jit_step(triplets, model, max_iter, n_dof, N_triplets, tol, ftol, dtol):
     """Build a fully JIT-compiled function for one time step.
 
     Captures triplets and model as static pytree structure.
-    Returns a function: (q, u, aux, F_ext, free_dof, mass, dt, reg) -> StepResult
-    """
-    local_to_global = _build_scatter_indices(n_dof, N_triplets)
-    hess_row, hess_col = _build_hessian_scatter(local_to_global, N_triplets)
+    Returns a function: (q, u, aux, F_ext, free_mask, mass, dt, reg, ...) -> StepResult.
 
-    # Robust solver parameters (matching reference RobustSolver defaults)
-    cond_threshold = 1e12
-    reg_factor = 1e-8
+    The Hessian is stored in LAPACK banded format with bandwidth k=BANDWIDTH
+    and solved via scipy.linalg.solve_banded (through jax.pure_callback).
+    Boundary conditions are enforced by adding a large diagonal penalty at
+    fixed DOFs — preserving the banded structure end-to-end.
+    """
+    k = BANDWIDTH
+    local_to_global = _build_scatter_indices(n_dof, N_triplets)
+    band_row, band_col = _build_banded_scatter(local_to_global, N_triplets, k)
+
+    # Newton convergence / solver constants
     max_reg_factor_base = 1e-4
+    # Penalty for fixing Dirichlet DOFs. Must be much larger than any physical
+    # diagonal entry so the solve returns ≈0 at fixed DOFs. Added on top of
+    # the existing diagonal, never replaces it.
+    BC_PENALTY = jnp.float64(1e20)
 
     @eqx.filter_jit
-    def jit_step(q_n, u_n, aux, F_ext, free_dof, mass, dt, reg, static_sim, eta):
+    def jit_step(q_n, u_n, aux, F_ext, free_mask, mass, dt, reg, static_sim, eta):
         """One full implicit Euler step with Newton-Raphson.
 
         Returns: (q_new, u_new, aux_new, converged, n_iters, max_dq, initial_max_dq)
+
+        free_mask: (n_dof,) bool — True for free DOFs, False for Dirichlet-fixed.
         """
         M_dt2 = mass / dt**2
         M_dt = mass / dt
         # Viscous damping: F_damp = -eta * u. The Jacobian contribution is -eta/dt.
         # Cap eta/dt to avoid blow-up at tiny dt during adaptive retries.
         eta_dt = jnp.minimum(eta / dt, eta / jnp.float64(0.001))
-        n_free = free_dof.shape[0]
         # Scale max_reg_factor with caller's reg (allows escalation from outer loop)
         max_reg = jnp.maximum(max_reg_factor_base, reg)
 
+        free_f = free_mask.astype(jnp.float64)          # 1.0 free, 0.0 fixed
+        fixed_f = 1.0 - free_f                           # 1.0 fixed, 0.0 free
+        bc_diag = BC_PENALTY * fixed_f                   # (n_dof,) — penalty added to fixed diagonals
+
         # ── Per-triplet energy, gradient, Hessian via chain rule ──
-        # E→strain via autodiff, strain→q via autodiff with fixed bishop frame.
-        # This matches the reference's approach and ensures correct Hessian.
         from .analytical_grad_hess import compute_local_energy_grad_hess
 
         def compute_local(t, q_loc, a):
             return compute_local_energy_grad_hess(t, q_loc, a, model, t.bar_strain)
 
         def compute_and_assemble(q, aux_inner):
-            """Compute local E/g/H, assemble global grad+Hessian."""
+            """Compute local E/g/H; assemble global gradient + BANDED Hessian."""
             batch_q = _global_q_to_batch_q(q, N_triplets)
             _, local_g, local_H = jax.vmap(compute_local)(triplets, batch_q, aux_inner)
 
-            # Scatter gradient
+            # Scatter gradient (unchanged)
             F_g = jnp.zeros(n_dof).at[local_to_global.ravel()].add(local_g.ravel())
-            # Scatter Hessian
-            H_g = jnp.zeros((n_dof, n_dof)).at[hess_row, hess_col].add(local_H.reshape(-1))
-            return F_g, H_g
+
+            # Banded Hessian scatter: (2k+1, n_dof) instead of (n_dof, n_dof).
+            # Skips the O(n_dof²) zero-init that dominated at modest N.
+            H_banded = (
+                jnp.zeros((2 * k + 1, n_dof))
+                .at[band_row, band_col]
+                .add(local_H.reshape(-1))
+            )
+            return F_g, H_banded
 
         # ── Newton loop via lax.while_loop ──
-        # while_loop traces body ONCE (O(1) compile time vs O(max_iter) for scan)
         def newton_cond(carry):
             q, iteration, err0, err, max_dq, init_mdq, damping, running_max_dq = carry
             not_max_iter = iteration < max_iter
@@ -150,55 +161,45 @@ def _make_jit_step(triplets, model, max_iter, n_dof, N_triplets, tol, ftol, dtol
         def newton_body(carry):
             q, iteration, err0, _err_prev, _max_dq_prev, init_mdq, damping, running_max_dq = carry
 
-            # Update material frame for current iterate (matching reference:
-            # re-computes a1,a2,ref_twist at each Newton iteration via
-            # compute_time_parallel).
+            # Update material frame for current iterate (matching reference).
             batch_q_iter = _global_q_to_batch_q(q, N_triplets)
             aux_iter = jax.vmap(lambda a, lq: a.update(lq))(aux, batch_q_iter)
 
-            grad_E, hess_E = compute_and_assemble(q, aux_iter)
-            # Matching reference sign convention exactly:
-            #   forces  = +grad_E - gravity + inertia [+ damping]
-            #   jacobian = +hess_E + diag(M/dt²) [+ diag(eta/dt)]
-            #   dq = solve(jacobian, forces);  q -= dq
-            #
-            # Reference: forces -= F_elastic (=-grad_E) → +(grad_E)
-            #            forces -= gravity_forces (=M*g)  → -(M*g)
-            #            forces += inertial_force (=M/dt²(q-q_n) - M/dt*u_n)
-            #            forces -= damping_force (=-eta*u) → +(eta*u)
+            grad_E, hess_E_banded = compute_and_assemble(q, aux_iter)
+
+            # Residual (full n_dof). Sign convention matches the dense path.
             F_inertia = M_dt2 * (q - q_n) - M_dt * u_n
-            R = jnp.where(static_sim,
-                          grad_E - F_ext,
-                          grad_E - F_ext + F_inertia + eta * u_n)
-            H = jnp.where(static_sim,
-                          hess_E,
-                          hess_E + jnp.diag(M_dt2 + eta_dt))
+            R = jnp.where(
+                static_sim,
+                grad_E - F_ext,
+                grad_E - F_ext + F_inertia + eta * u_n,
+            )
 
-            R_free = R[free_dof]
-            H_free = H[jnp.ix_(free_dof, free_dof)]
+            # Banded Hessian: add mass/dt² + eta/dt + BC penalty to main diagonal.
+            dyn_diag = jnp.where(static_sim, jnp.zeros(n_dof), M_dt2 + eta_dt)
+            H_banded = hess_E_banded.at[k, :].add(dyn_diag + bc_diag)
 
-            # Robust linear solve (condition check + SVD fallback)
-            dq_free = _robust_solve(
-                H_free, R_free, reg, cond_threshold, reg_factor, max_reg)
+            # Zero residual at fixed DOFs so the penalty-driven solve returns ≈0 there.
+            R_masked = R * free_f
 
-            # Guard: skip solve when residual is near-zero to avoid amplifying
-            # near-zero Hessian eigenvalues (matches reference _min_force=1e-8)
-            dq_free = jnp.where(
-                jnp.linalg.norm(R_free) < 1e-8,
-                jnp.zeros_like(dq_free),
-                dq_free)
+            # Robust banded solve (Tikhonov + escalation + SVD fallback on NaN).
+            dq_full = _robust_banded_solve(H_banded, R_masked, reg, max_reg, k)
 
-            # Constant damping factor after iteration 10 (matching reference:
-            # _adaptive_damping returns max(alpha * 0.9, 0.1) with alpha=1.0 constant)
+            # Guard: skip solve when residual is near-zero (matches reference _min_force=1e-8)
+            err = jnp.linalg.norm(R_masked)
+            dq_full = jnp.where(err < 1e-8, jnp.zeros_like(dq_full), dq_full)
+
+            # Enforce dq[fixed] = 0 exactly (penalty gives ≈0, this makes it exact).
+            dq_full = dq_full * free_f
+
+            # Constant damping factor after iteration 10 (matching reference).
             d = jnp.where(iteration >= 10, jnp.float64(0.9), jnp.float64(1.0))
-            dq_damped = dq_free * d
-            q_new = q.at[free_dof].add(-dq_damped)
+            dq_damped = dq_full * d
+            q_new = q - dq_damped
 
             step_max_dq = jnp.max(jnp.abs(dq_damped))
-            err = jnp.linalg.norm(R_free)
             err0_new = jnp.where(iteration == 0, err, err0)
-            init_mdq_new = jnp.where(iteration == 0, jnp.max(jnp.abs(dq_free)), init_mdq)
-            # Track running maximum displacement across all iterations (for dt reduction check)
+            init_mdq_new = jnp.where(iteration == 0, jnp.max(jnp.abs(dq_full)), init_mdq)
             new_running_max = jnp.maximum(running_max_dq, step_max_dq)
 
             return (q_new, iteration + 1, err0_new, err, step_max_dq, init_mdq_new, d, new_running_max)
@@ -326,6 +327,9 @@ class TimeStepper:
         if bc_idx.shape[0] > 0:
             free_mask = free_mask.at[bc_idx].set(False)
         self._free_dof = jnp.where(free_mask)[0]
+        # Full-n_dof boolean mask; passed to JIT step so its shape stays static
+        # across BC changes (no recompilation when n_free changes).
+        self._free_mask = free_mask
 
     def set_nodes_to_track_forces(self, node_indices: np.ndarray):
         self.track_forces_nodes = node_indices
@@ -369,7 +373,7 @@ class TimeStepper:
         reg = jnp.float64(self.current_reg)
         static_sim = jnp.bool_(self.sim_params.static_sim)
 
-        free_dof = self._free_dof
+        free_mask = self._free_mask
         F_ext_base = self.rod.F_ext
 
         # Build per-step scan function
@@ -389,7 +393,7 @@ class TimeStepper:
                 if F_ext_schedule is not None else F_ext_base
 
             q_new, u_new, aux_new, conv, n_it, mdq, imdq = self._jit_step(
-                q_bc, u, aux, F_ext, free_dof, self.mass, dt, reg, static_sim,
+                q_bc, u, aux, F_ext, free_mask, self.mass, dt, reg, static_sim,
                 jnp.float64(self.eta)
             )
 
@@ -459,7 +463,7 @@ class TimeStepper:
         _t_wall_start = __import__('time').perf_counter()
 
         log_counter = 0
-        free_dof = self._free_dof
+        free_mask = self._free_mask
         # Pre-create JAX scalars to avoid per-step allocation
         _reg = jnp.float64(self.current_reg)
         _static_sim = jnp.bool_(sp.static_sim)
@@ -492,7 +496,7 @@ class TimeStepper:
                 _F_ext = self.rod.F_ext
                 if self.rod.bc.idx_b is not bc_before:
                     self._update_free_dof()
-                    free_dof = self._free_dof
+                    free_mask = self._free_mask
 
             # ── Per-step retry loop with regularization escalation ──
             dt_reductions_this_step = 0
@@ -503,7 +507,7 @@ class TimeStepper:
                 _reg = jnp.float64(self.current_reg)
                 q_new, u_new, aux_new, conv, n_it, mdq, imdq = _step(
                     self.q, self.u, self.aux, _F_ext,
-                    free_dof, _mass, _dt, _reg, _static_sim, _eta,
+                    free_mask, _mass, _dt, _reg, _static_sim, _eta,
                 )
                 conv_val = bool(conv)
                 imdq_val = float(imdq)
@@ -520,7 +524,7 @@ class TimeStepper:
 
                 def _rollback_and_reduce_dt():
                     """Restore pre-BC state, reduce dt, re-apply BCs with new dt."""
-                    nonlocal dt, _dt, current_time, free_dof, _F_ext
+                    nonlocal dt, _dt, current_time, free_mask, _F_ext
                     dt = max(self.min_dt, dt * self.dt_reduction_factor)
                     _dt = jnp.float64(dt)
                     self.current_reg = self.base_reg
@@ -536,7 +540,7 @@ class TimeStepper:
                         _F_ext = self.rod.F_ext
                         if self.rod.bc.idx_b is not bc_before:
                             self._update_free_dof()
-                            free_dof = self._free_dof
+                            free_mask = self._free_mask
 
                 def _rollback_reg_only():
                     """Restore post-BC state for regularization retry (same dt)."""

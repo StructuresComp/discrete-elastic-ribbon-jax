@@ -83,48 +83,51 @@ pytest tests/ -v
 - Robust linear solver (Tikhonov regularization + SVD fallback)
 - Analytical strain Jacobian + autodiff energy Hessian (hybrid approach)
 - Block-diagonal Hessian assembly via `vmap` over per-triplet stencils (20x speedup over naive full Hessian)
+- Banded Hessian assembly + LAPACK banded factorisation (bandwidth `k=10` from the 11-DOF triplet stencil), giving ~3x speedup at N=45 and ~5x at N=63 over the dense baseline
 - Shear-induced bifurcation simulation reproducing reference results across all W/L ratios
 - Per-step metrics tracking: dt history, Newton iteration counts
 
 #### Benchmark Results
 
-Shear-induced bifurcation simulation on CPU. Backward shear phase only (t = 7.55 to 12.5s, sim duration = 4.95s), where the ribbon undergoes buckling and adaptive time-stepping is most active.
+Shear-induced bifurcation simulation on a single CPU core, with the banded Hessian factorisation (bandwidth `k=10`). Backward shear phase only (t = 7.55 to 12.5s, sim duration = 4.95s), where the ribbon undergoes buckling and adaptive time-stepping is most active.
 
-**N = 45 nodes (176 DOFs)**
-
-| W/L  | Model     | x sim-time | Wall (s) | Steps | NR iters | NR/step |
-|------|-----------|------------|----------|-------|----------|---------|
-| 1/40 | Kirchhoff | 0.68x      | 3.4      | 283   | 1409     | 5.0     |
-| 1/40 | Sano      | 0.67x      | 3.3      | 283   | 1410     | 5.0     |
-| 1/40 | Audoly    | 0.45x      | 2.2      | 167   | 841      | 5.0     |
-| 1/20 | Kirchhoff | 1.96x      | 9.7      | 778   | 4287     | 5.5     |
-| 1/20 | Sano      | 1.80x      | 8.9      | 753   | 4136     | 5.5     |
-| 1/20 | Audoly    | 2.75x      | 13.6     | 616   | 3389     | 5.5     |
-| 1/12 | Kirchhoff | 2.04x      | 10.1     | 492   | 3009     | 6.1     |
-| 1/12 | Sano      | 1.75x      | 8.7      | 502   | 2965     | 5.9     |
-| 1/12 | Audoly    | 5.70x      | 28.2     | 1359  | 9047     | 6.7     |
-| 1/6  | Kirchhoff | 9.07x      | 44.9     | 1418  | 8977     | 6.3     |
-| 1/6  | Sano      | 8.02x      | 39.7     | 1440  | 9236     | 6.4     |
-| 1/6  | Audoly    | 7.36x      | 36.4     | 1027  | 6830     | 6.7     |
-
-**N = 63 nodes (248 DOFs)**
+**N = 45 nodes (179 DOFs)**
 
 | W/L  | Model     | x sim-time | Wall (s) | Steps | NR iters | NR/step |
 |------|-----------|------------|----------|-------|----------|---------|
-| 1/40 | Kirchhoff | 1.39x      | 6.9      | 321   | 1798     | 5.6     |
-| 1/40 | Sano      | 1.31x      | 6.5      | 286   | 1648     | 5.8     |
-| 1/40 | Audoly    | 1.29x      | 6.4      | 257   | 1483     | 5.8     |
-| 1/20 | Kirchhoff | 3.14x      | 15.6     | 735   | 4467     | 6.1     |
-| 1/20 | Sano      | 2.90x      | 14.3     | 645   | 4102     | 6.4     |
-| 1/20 | Audoly    | 6.81x      | 33.7     | 703   | 4407     | 6.3     |
-| 1/12 | Kirchhoff | 164x       | 812.4    | 1227  | 7952     | 6.5     |
-| 1/12 | Sano      | 13.4x      | 66.1     | 1498  | 9468     | 6.3     |
-| 1/12 | Audoly    | 17.3x      | 85.4     | 2353  | 15092    | 6.4     |
-| 1/6  | Kirchhoff | 48.2x      | 238.6    | 2524  | 18593    | 7.4     |
-| 1/6  | Sano      | 54.8x      | 271.4    | 2500  | 17368    | 6.9     |
-| 1/6  | Audoly    | 54.6x      | 270.3    | 2465  | 16167    | 6.6     |
+| 1/40 | Kirchhoff | 0.32x      | 1.58     | 285   | 1456     | 5.1     |
+| 1/40 | Sano      | 0.31x      | 1.51     | 284   | 1448     | 5.1     |
+| 1/40 | Audoly    | 0.26x      | 1.31     | 214   | 1140     | 5.3     |
+| 1/20 | Kirchhoff | 0.52x      | 2.57     | 604   | 3426     | 5.7     |
+| 1/20 | Sano      | 0.61x      | 3.00     | 708   | 3831     | 5.4     |
+| 1/20 | Audoly    | 1.57x      | 7.77     | 1516  | 10346    | 6.8     |
+| 1/12 | Kirchhoff | 0.59x      | 2.93     | 513   | 3140     | 6.1     |
+| 1/12 | Sano      | 0.58x      | 2.89     | 497   | 2963     | 6.0     |
+| 1/12 | Audoly    | 0.72x      | 3.55     | 471   | 2906     | 6.2     |
+| 1/6  | Kirchhoff | 2.16x      | 10.71    | 1436  | 8921     | 6.2     |
+| 1/6  | Sano      | 1.65x      | 8.15     | 1164  | 7512     | 6.5     |
+| 1/6  | Audoly    | 3.39x      | 16.77    | 1430  | 8496     | 5.9     |
+
+**N = 63 nodes (251 DOFs)**
+
+| W/L  | Model     | x sim-time | Wall (s) | Steps | NR iters | NR/step |
+|------|-----------|------------|----------|-------|----------|---------|
+| 1/40 | Kirchhoff | 0.35x      | 1.75     | 338   | 1832     | 5.4     |
+| 1/40 | Sano      | 0.32x      | 1.59     | 306   | 1673     | 5.5     |
+| 1/40 | Audoly    | 0.30x      | 1.46     | 265   | 1454     | 5.5     |
+| 1/20 | Kirchhoff | 0.72x      | 3.55     | 786   | 4653     | 5.9     |
+| 1/20 | Sano      | 0.63x      | 3.12     | 630   | 3864     | 6.1     |
+| 1/20 | Audoly    | 1.26x      | 6.22     | 763   | 4569     | 6.0     |
+| 1/12 | Kirchhoff | 1.83x      | 9.04     | 1208  | 7924     | 6.6     |
+| 1/12 | Sano      | 2.01x      | 9.96     | 1118  | 7097     | 6.3     |
+| 1/12 | Audoly    | 2.80x      | 13.87    | 2611  | 16898    | 6.5     |
+| 1/6  | Kirchhoff | 8.23x      | 40.76    | 2535  | 18487    | 7.3     |
+| 1/6  | Sano      | 6.91x      | 34.22    | 2247  | 15758    | 7.0     |
+| 1/6  | Audoly    | 8.29x      | 41.05    | 2181  | 14506    | 6.7     |
 
 *"x sim-time"* = wall-clock / simulated duration. Values < 1x mean faster than real-time.
+
+Across all 24 configurations the per-Newton-iteration wall-clock scales close to the ideal `O(N)` (median `Wall/#NR` ratio `1.1x` for a `1.4x` DOF increase, N=45 → N=63). The residual super-linear wall-time growth at wide ribbons is driven by the adaptive time-stepper taking 1.5–5x more steps at the finer mesh — spatial resolution of stiff bifurcation features, not solver cost.
 
 #### Architecture
 

@@ -252,6 +252,55 @@ q, u = jit_newton_step(q, u, dt, model, rod, ...)
 
 ---
 
+### Milestone 11: Banded Linear Solver for O(N) Scaling [TODO]
+> Replace the current dense Hessian assembly + dense LAPACK solve with banded storage + banded factorization to recover true O(N) per-step cost.
+
+**Motivation.** Benchmarks for the paper's Computational Cost Analysis show that going from N=45 to N=63 (a 1.4x DOF increase) produces a ~2x wall-clock increase — close to N² scaling. Current bottlenecks:
+
+- `time_stepper.py:136` — `H_g = jnp.zeros((n_dof, n_dof)).at[hess_row, hess_col].add(blocks)` allocates and zero-initializes an O(N_dof²) dense matrix every Newton iteration, even though only O(N) entries are nonzero.
+- `solver.py:14, 40` and `time_stepper.py:69, 75` — `jnp.linalg.solve(H_reg, res)` is a dense O(N_dof³) LAPACK factorization.
+- The triplet stencil (11 DOFs) gives a fixed bandwidth k≈11; Wunderlich's 5-node stencil gives k≈15. Bandwidth does not grow with N, so banded storage is the natural fit.
+- Existing TODO at `solver.py:37` already flags "use SOCU for blockdiagonal".
+
+#### Option 1 (recommended): LAPACK banded solver via `jax.scipy.linalg.solve_banded`
+
+- [ ] Derive bandwidth k at `Rod` construction time from the stencil definition (triplet → k=11, Wunderlich → k=15). Store on `Rod`.
+- [ ] Precompute banded scatter indices alongside the existing `hess_row`, `hess_col`:
+  - `banded_row = k + global_row - global_col`
+  - `banded_col = global_col`
+  - Skip / mask entries where `|global_row - global_col| > k` (should be empty by construction — add an assert in tests).
+- [ ] Replace the dense assembly in `time_stepper.py:136`:
+  - New: `H_banded = jnp.zeros((2*k+1, n_dof)).at[banded_row, banded_col].add(vmapped_blocks)`
+  - Keep the `vmap` over triplets; only the scatter target changes.
+- [ ] Replace dense solves:
+  - `time_stepper.py:69, 75` → `jax.scipy.linalg.solve_banded((k, k), H_banded, res)`
+  - `solver.py:14, 40` → same, preserving the adaptive regularization path
+- [ ] Tikhonov regularization: add μ to row k (the main diagonal of banded storage) instead of forming `H + μI`.
+- [ ] Condition-number heuristic in the robust solver: replace `jnp.linalg.cond(H)` (requires full SVD of dense) with a cheap banded proxy (e.g., ratio of max/min absolute main-diagonal entry after factorization, or banded 1-norm condition estimate).
+- [ ] SVD fallback path: if regularization fails, convert banded → dense only in that branch (rare, bifurcation points only) so the fallback semantics are preserved.
+- [ ] Preserve the IFT `filter_custom_vjp` in `solver.py`: the adjoint linear system uses the same Hessian, so the banded factorization (or its LU factors) can be cached for the backward pass.
+- [ ] Tests:
+  - `tests/test_banded_assembly.py` — banded scatter agrees with dense scatter at rtol=1e-12 on a fixed random state.
+  - `tests/test_banded_solve.py` — `solve_banded` output matches `jnp.linalg.solve` at rtol=1e-10 for rod-sized Hessians.
+  - Re-run the existing shear_induced_bifurcation regression: `||q_banded - q_dense|| < 1e-10` over the full trajectory.
+- [ ] Re-run the paper's efficiency benchmarks (N=45, N=63, all widths, Kirchhoff/Sano/Audoly). Update Tables in `§Computational Cost Analysis`; expected: ~linear-in-N per-step cost, largest gain at N=63 / W/L=1/12 (currently the 812s Kirchhoff outlier should drop substantially, since time-step count stays the same but each step is cheaper).
+- [ ] Special case Wunderlich: 5-node stencil → k=15 instead of 11. Banded solver handles this identically; only k changes.
+
+**Estimated effort:** ~50–100 LOC + tests + benchmark re-run. No changes to energy models, BCs, tracking, or time-stepping logic.
+
+**Expected gain:** O(N²) alloc/zero and O(N³) solve → O(N) both. At N=63 this alone should collapse wall-clock back toward the N=45 per-step cost; gains grow with N and become essential at N ≥ 100.
+
+**Files:** `time_stepper.py`, `solver.py`, `systems/rod.py` (store k and banded indices), `tests/test_banded_solver.py` (new).
+
+#### Alternative approaches (not planned; noted for completeness)
+
+- **Option 2 — Block-banded Thomas algorithm (the SOCU TODO in `solver.py:37`).** Block-tridiagonal factorization exploiting the 4-DOF-per-edge block structure. Same O(N) asymptotic as Option 1 but with cache-friendly blocked BLAS. More code to write; revisit if Option 1's constant factors prove insufficient.
+- **Option 3 — Matrix-free Newton-Krylov.** Never form H; use `jax.jvp(grad_E, (q,), (v,))` for Hessian-vector products, solve with `jax.scipy.sparse.linalg.cg` / `gmres`. O(N) memory, no factorization. Risk: near bifurcations H is badly conditioned and the current adaptive Tikhonov scheme relies on a direct factorization for robustness; would need a banded-ILU or similar preconditioner. Attractive for N ≥ 10³, probably not worth it at current sizes.
+- **Option 4 — BCOO sparse assembly.** Build `jax.experimental.sparse.BCOO` directly from per-element `(N_triplets, 11, 11)` blocks, skip the dense detour entirely. JAX's sparse direct-solve support is thinner than banded, so less turnkey than Option 1.
+- **Option 5 — Reuse dense buffer across Newton iterations.** Marginal: the O(N²) zero-init still happens every iteration, and XLA already aliases buffers opportunistically. Not worth pursuing alone.
+
+---
+
 ## Architecture Diagram
 
 ```
@@ -334,6 +383,7 @@ Milestone 0 (fixes) → Milestone 1 (energy models) → Milestone 2 (dynamic sol
     → Milestone 5 (BCs & I/O) → Milestone 6 (tracking)
     → Milestone 7 (bifurcation sim) → Milestone 8 (homotopy)
     → Milestone 9 (perf) → Milestone 10 (HoDEL)
+    → Milestone 11 (banded solver — independent of 10; can be done anytime after 7)
 ```
 
 Milestones 1 and 5 can be developed in parallel. Milestone 4 can start after Milestone 2.
