@@ -1,8 +1,48 @@
-### Dismech-JAX
+<h1 align="center">Discrete Elastic Ribbons</h1>
+<h3 align="center">A Unified Discrete Differential Geometry Framework for One-Dimensional Energy Models</h3>
 
-JAX/Equinox port of the [Discrete Elastic Ribbon](https://github.com/shivamkumarpanda/discrete-elastic-ribbon) simulator for efficient differentiable physics simulation of elastic ribbons undergoing shear-induced buckling.
+<p align="center">
+  <strong>Shivam K. Panda</strong> &nbsp;·&nbsp; <strong>M. Khalid Jawed</strong><br>
+  <em>University of California, Los Angeles</em>
+</p>
 
-#### Setup
+<p align="center">
+  <a href="https://github.com/StructuresComp/discrete-elastic-ribbon-jax">
+    <img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?logo=arxiv&logoColor=white" alt="arXiv">
+  </a>
+  <a href="https://github.com/StructuresComp/discrete-elastic-ribbon-jax">
+    <img src="https://img.shields.io/badge/Project-Page-1f72bb?logo=github&logoColor=white" alt="Project Page">
+  </a>
+  <a href="https://github.com/StructuresComp/discrete-elastic-ribbon">
+    <img src="https://img.shields.io/badge/Reference%20Impl-Python-3776ab?logo=python&logoColor=white" alt="Python Reference Implementation">
+  </a>
+  <a href="https://github.com/StructuresComp/discrete-elastic-ribbon-jax">
+    <img src="https://img.shields.io/badge/High--Performance%20Impl-JAX-ff6f00?logo=google&logoColor=white" alt="JAX Implementation">
+  </a>
+</p>
+
+## Abstract
+
+Elastic ribbons — slender structures whose length (*L*), width (*W*), and thickness (*b*) satisfy *L* ≫ *W* ≫ *b* — exhibit mechanical behaviors intermediate between one-dimensional rods (*L* ≫ *W*, *b*) and two-dimensional plates (*L*, *W* ≫ *b*). In quadratic Kirchhoff-type rod-based frameworks such as Discrete Elastic Rods (DER), the governing equilibrium equations are independent of width and therefore cannot capture width-dependent mechanical effects. Reduced centerline-based ribbon models attempt to capture width dependence via coupled bending–twisting energies; however, their relative accuracy remains unclear due to the absence of a unified simulation framework.
+
+In this work, we formulate a framework grounded in discrete differential geometry where the energy is expressed as functions of coupled bending–twisting strain measures along the centerline, rather than a linear sum of quadratic bending and twisting energies in DER. We derive analytical gradients and Hessians of the energy that enable implicit time integration. Within this unified setting, we compare five ribbon models: **Kirchhoff**, **Sadowsky**, **Wunderlich**, **Sano**, and **Audoly**. As a benchmark, a straight ribbon is longitudinally constrained into a pre-buckled arch and subjected to transverse displacement, inducing a supercritical pitchfork bifurcation. Predicted bifurcation thresholds are compared against shell-based finite element simulations, with the **Sano** model providing the closest agreement in capturing width-dependent shifts. Our high-performance JAX-based implementation achieves *O*(*N*) per-iteration cost and confirms that the Sano model introduces negligible per-iteration overhead relative to standard DER.
+
+## Implementations
+
+This work is provided through two official repositories:
+
+| Repository | Description |
+|---|---|
+| [`discrete-elastic-ribbon`](https://github.com/StructuresComp/discrete-elastic-ribbon) | **Reference Python implementation.** All five energy models, adaptive implicit Euler with a robust regularized linear solver, and a homotopy API for changing rod geometry/material during simulation. |
+| [`discrete-elastic-ribbon-jax`](https://github.com/StructuresComp/discrete-elastic-ribbon-jax) | **High-performance JAX/Equinox implementation.** Banded Hessian assembly with LAPACK banded factorization, vectorized stencil operations, and end-to-end differentiability through the implicit Newton–Raphson solver. |
+
+---
+
+## About this Repository
+
+You are reading the **high-performance JAX/Equinox implementation**. It is a port of the reference [`discrete-elastic-ribbon`](https://github.com/StructuresComp/discrete-elastic-ribbon) codebase, with banded Hessian assembly, vectorized per-stencil operations via `vmap`, and end-to-end differentiability through the implicit Newton–Raphson solver. It targets efficient differentiable simulation of elastic ribbons undergoing shear-induced buckling and related bifurcation studies.
+
+## Setup
 
 ```bash
 conda activate ribbon-jax
@@ -12,7 +52,7 @@ pip install -e .
 
 **Dependencies:** jax, jaxlib, equinox, numpy, scipy, matplotlib
 
-#### How to Run
+## How to Run
 
 **Shear-induced bifurcation (single run):**
 
@@ -74,7 +114,7 @@ cd discrete-elastic-ribbon-jax
 pytest tests/ -v
 ```
 
-#### Accomplishments
+## Features
 
 - Complete JAX/Equinox reimplementation of the Discrete Elastic Rod (DER) framework
 - Five energy models: **Kirchhoff**, **Sano**, **Audoly**, **Sadowsky**, **Wunderlich**
@@ -87,7 +127,7 @@ pytest tests/ -v
 - Shear-induced bifurcation simulation reproducing reference results across all W/L ratios
 - Per-step metrics tracking: dt history, Newton iteration counts
 
-#### Benchmark Results
+## Benchmark Results
 
 Shear-induced bifurcation simulation on a single CPU core, with the banded Hessian factorisation (bandwidth `k=10`). Backward shear phase only (t = 7.55 to 12.5s, sim duration = 4.95s), where the ribbon undergoes buckling and adaptive time-stepping is most active.
 
@@ -129,7 +169,7 @@ Shear-induced bifurcation simulation on a single CPU core, with the banded Hessi
 
 Across all 24 configurations the per-Newton-iteration wall-clock scales close to the ideal `O(N)` (median `Wall/#NR` ratio `1.1x` for a `1.4x` DOF increase, N=45 → N=63). The residual super-linear wall-time growth at wide ribbons is driven by the adaptive time-stepper taking 1.5–5x more steps at the finer mesh — spatial resolution of stiff bifurcation features, not solver cost.
 
-#### Architecture
+## Architecture
 
 ```
 TimeStepper → Rod (System) → Triplet (Stencil) + Energy Model
